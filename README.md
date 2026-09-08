@@ -124,6 +124,25 @@ ends.
 
 Ports: 21114 (API), 21115–21117 (`hbbs`/`hbbr`), 21118–21119 (websocket).
 
+## Your own domain
+
+Point a subdomain at the box — `remote.example.com` — and put it in the clients instead of
+an IP:
+
+```toml
+custom-rendezvous-server = 'remote.example.com'
+relay-server = 'remote.example.com'
+api-server = 'https://remote.example.com'
+```
+
+The API server (port 21114) is plain HTTP by default, so put nginx in front of it with a
+certificate if the login page is reachable from the internet — accounts and tokens should
+not travel in the clear. `hbbs`/`hbbr` traffic is encrypted on its own and needs no proxy.
+
+Accounts are created on your server, in the API server's admin panel (`/_admin/`). Nobody
+signs in through rustdesk.com, no address book leaves the machine, and there is no account
+on someone else's infrastructure to lose.
+
 Client-side configuration, logs and the workarounds tried before this patch are collected
 in [rustdesk-selfhosted-client-notes](https://github.com/upsoftt/rustdesk-selfhosted-client-notes).
 
