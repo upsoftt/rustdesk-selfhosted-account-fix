@@ -1,0 +1,8 @@
+# build artifacts
+hbbs
+hbbs-patched
+*.exe
+target/
+src-tree/
+cargo/
+*.log

@@ -1,0 +1,148 @@
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -16,7 +16,7 @@
+         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+         *,
+     },
+-    tcp::FramedStream,
++    tcp::{Encrypt, FramedStream},
+     timeout,
+     tokio::{
+         self,
+@@ -31,7 +31,7 @@
+     AddrMangle, ResultType,
+ };
+ use ipnetwork::Ipv4Network;
+-use sodiumoxide::crypto::sign;
++use sodiumoxide::crypto::{box_, secretbox, sign};
+ use std::{
+     collections::HashMap,
+     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+@@ -52,6 +52,9 @@
+ type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+ enum Sink {
+     TcpStream(TcpStreamSink),
++    // Same as TcpStream, but the payload is encrypted with the symmetric key
++    // negotiated in secure_handshake(). Signed-in clients (>=1.4.1) require it.
++    SecureTcpStream(TcpStreamSink, Encrypt),
+     Ws(WsSink),
+ }
+ type Sender = mpsc::UnboundedSender<Data>;
+@@ -855,6 +858,10 @@
+                     Sink::TcpStream(s) => {
+                         allow_err!(s.send(Bytes::from(bytes)).await);
+                     }
++                    Sink::SecureTcpStream(s, enc) => {
++                        let encrypted = enc.enc(&bytes);
++                        allow_err!(s.send(Bytes::from(encrypted)).await);
++                    }
+                     Sink::Ws(ws) => {
+                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                     }
+@@ -1215,11 +1222,46 @@
+                 }
+             }
+         } else {
+-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+-            sink = Some(Sink::TcpStream(a));
+-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+-                    break;
++            let mut framed = Framed::new(stream, BytesCodec::new());
++            // Clients signed in to an API server (>= 1.4.1) expect the rendezvous
++            // server to open the connection with a signed KeyExchange and then speak
++            // over an encrypted channel. Without it they sit in secure_tcp() until the
++            // read timeout, so every connection attempt costs ~18 seconds and often
++            // fails outright. Only done when a key is configured (self.inner.sk).
++            let mut sym_key: Option<secretbox::Key> = None;
++            let mut pending: Option<BytesMut> = None;
++            if let Some(sk) = self.inner.sk.clone() {
++                match Self::secure_handshake(&mut framed, &sk).await {
++                    Ok((k, first)) => {
++                        sym_key = k;
++                        pending = first;
++                    }
++                    Err(err) => {
++                        log::debug!("Secure handshake with {:?} failed: {}", addr, err);
++                    }
++                }
++            }
++            let mut decrypt = sym_key.clone().map(Encrypt::new);
++            let (a, mut b) = framed.split();
++            sink = Some(match sym_key {
++                Some(k) => Sink::SecureTcpStream(a, Encrypt::new(k)),
++                None => Sink::TcpStream(a),
++            });
++            let mut keep = true;
++            if let Some(bytes) = pending {
++                keep = self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
++            }
++            while keep {
++                match timeout(30_000, b.next()).await {
++                    Ok(Some(Ok(mut bytes))) => {
++                        if let Some(dec) = decrypt.as_mut() {
++                            if dec.dec(&mut bytes).is_err() {
++                                break;
++                            }
++                        }
++                        keep = self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
++                    }
++                    _ => break,
+                 }
+             }
+         }
+@@ -1230,6 +1272,54 @@
+         Ok(())
+     }
+ 
++    // Mirrors secure_tcp() on the client side: send our freshly generated box public
++    // key signed with the server key, then read back the client's public key together
++    // with the symmetric key sealed for us. Returns the symmetric key and, when the
++    // peer did not take part in the exchange, the message it sent instead, so the
++    // caller can still process it.
++    async fn secure_handshake(
++        framed: &mut Framed<TcpStream, BytesCodec>,
++        sk: &sign::SecretKey,
++    ) -> ResultType<(Option<secretbox::Key>, Option<BytesMut>)> {
++        let (our_pk_b, our_sk_b) = box_::gen_keypair();
++        let mut msg_out = RendezvousMessage::new();
++        msg_out.set_key_exchange(KeyExchange {
++            keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
++            ..Default::default()
++        });
++        framed.send(Bytes::from(msg_out.write_to_bytes()?)).await?;
++        let bytes = match timeout(3_000, framed.next()).await {
++            Ok(Some(Ok(bytes))) => bytes,
++            _ => return Ok((None, None)),
++        };
++        let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) else {
++            return Ok((None, Some(bytes)));
++        };
++        match msg_in.union {
++            Some(rendezvous_message::Union::KeyExchange(ex)) => {
++                if ex.keys.len() != 2 || ex.keys[0].len() != box_::PUBLICKEYBYTES {
++                    bail!("Invalid key exchange message");
++                }
++                let mut their_pk = [0u8; box_::PUBLICKEYBYTES];
++                their_pk.copy_from_slice(&ex.keys[0]);
++                let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
++                let Ok(sym) = box_::open(
++                    &ex.keys[1],
++                    &nonce,
++                    &box_::PublicKey(their_pk),
++                    &our_sk_b,
++                ) else {
++                    bail!("Failed to open the sealed symmetric key");
++                };
++                let Some(key) = secretbox::Key::from_slice(&sym) else {
++                    bail!("Invalid symmetric key length");
++                };
++                Ok((Some(key), None))
++            }
++            _ => Ok((None, Some(bytes))),
++        }
++    }
++
+     #[inline]
+     async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
+         if version.is_empty() || self.inner.sk.is_none() {
