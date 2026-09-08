@@ -124,6 +124,9 @@ ends.
 
 Ports: 21114 (API), 21115–21117 (`hbbs`/`hbbr`), 21118–21119 (websocket).
 
+Client-side configuration, logs and the workarounds tried before this patch are collected
+in [rustdesk-selfhosted-client-notes](https://github.com/upsoftt/rustdesk-selfhosted-client-notes).
+
 ## Notes
 
 - **A server upgrade drops the patch.** After updating `rustdesk-server`, re-apply it.
