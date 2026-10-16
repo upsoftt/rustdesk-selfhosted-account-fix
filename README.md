@@ -146,6 +146,39 @@ on someone else's infrastructure to lose.
 Client-side configuration, logs and the workarounds tried before this patch are collected
 in [rustdesk-selfhosted-client-notes](https://github.com/upsoftt/rustdesk-selfhosted-client-notes).
 
+## If sessions drop every 15-30 minutes, look at the relay, not at the client
+
+A different failure that wastes a lot of time here. The symptom arrives as "the second
+monitor keeps falling off": a monitor opened in its own window freezes on *Connected,
+waiting for image* and has to be cancelled, while the main window carries on. What
+actually happens is that the whole session drops and reconnects — the client restores
+`monitor0` only, so the extra window is the visible half of a transport problem.
+
+Where to look, in order:
+
+1. `create_relay requested from …` lines in the **host** log. One every 15-30 minutes is a
+   dropping transport, not a client bug.
+2. Whatever else the host does against the server at that moment. Here every drop came
+   5-7 seconds after `/api/heartbeat` timed out — both were the same 10-20 second loss of
+   connectivity at the relay's datacenter, measured independently from three sites.
+3. `hbbr`'s own log: `Relay of … closed: Timeout` is written after 30 seconds of silence
+   (`last_recv_time` in `relay_server.rs`), and the host gives up on the same 30-second
+   rule (`SEC30` in `connection.rs`). Outages shorter than that still kill the session,
+   because a broken path resets the TCP connection outright — the host logs `Reset by the
+   peer` within a second. Raising either timeout changes nothing.
+
+The fix is to move the relay somewhere with a healthy uplink: run `hbbr` there with the
+**same `id_ed25519` pair** as `hbbs`, start `hbbs` with `-r <new-relay>:21117`, and note
+that a host's own `relay-server` option wins over whatever `hbbs` hands out
+(`get_relay_server` in `rendezvous_mediator.rs`) — so clear or update it on each host:
+
+```
+rustdesk --option relay-server <new-relay>     # read it back with no value; needs admin
+```
+
+The ID server can stay where it is: it is only needed while a session is being set up, so
+its outages no longer show up as dropped sessions.
+
 ## Notes
 
 - **A server upgrade drops the patch.** After updating `rustdesk-server`, re-apply it.
